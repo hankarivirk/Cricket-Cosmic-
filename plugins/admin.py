@@ -4,113 +4,111 @@ from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message
 from config import Config
 from database.users import get_all_users, get_user_count, get_all_groups, get_group_count
-from database.stats import reset_stats, get_stats
+from database.stats import reset_stats
 from database import matches_col
 import utils.state as state
 
 ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
-def is_admin(_, __, message: Message):
-    return message.from_user and message.from_user.id == Config.ADMIN_ID
+def _is_bot_admin(_, __, message: Message):
+    return bool(message.from_user and message.from_user.id == Config.ADMIN_ID)
 
-admin_filter = filters.create(is_admin)
+admin_filter = filters.create(_is_bot_admin)
+
+async def _is_group_admin(client, chat_id, user_id) -> bool:
+    try:
+        m = await client.get_chat_member(chat_id, user_id)
+        return m.status in ADMIN_STATUSES
+    except Exception:
+        return False
+
+# ── Bot-owner commands ────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("broadcast") & admin_filter)
 async def broadcast_cmd(client: Client, message: Message):
     if len(message.command) < 2:
-        return await message.reply("⚠️  Usage: `/broadcast <message>`")
-
-    text = message.text.split(None, 1)[1]
-    users = await get_all_users()
-
+        return await message.reply("⚠️ Usage: `/broadcast <message>`")
+    text   = message.text.split(None, 1)[1]
+    users  = await get_all_users()
     sent, failed = 0, 0
-    status = await message.reply(f"📢  Broadcasting to **{len(users)}** users...")
-
+    status = await message.reply(f"📢 Broadcasting to **{len(users)}** users...")
     for u in users:
         try:
-            await client.send_message(u["_id"], f"📢  **Announcement**\n\n{text}")
+            await client.send_message(u["_id"], f"📢 **Announcement**\n\n{text}")
             sent += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)
-
     await status.edit_text(
-        f"✅  **Broadcast Complete!**\n\n"
-        f"┣  Sent: **{sent}**\n"
-        f"┗  Failed: **{failed}**"
+        f"✅ **Broadcast Complete!**\n\n"
+        f"┣ Sent:   **{sent}**\n"
+        f"┗ Failed: **{failed}**"
     )
 
 @Client.on_message(filters.command("users") & admin_filter)
 async def users_cmd(client: Client, message: Message):
-    user_count  = await get_user_count()
-    group_count = await get_group_count()
+    uc = await get_user_count()
+    gc = await get_group_count()
     await message.reply(
-        f"📊  **Bot Statistics**\n"
+        f"📊 **Bot Statistics**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤  Total Users:  **{user_count}**\n"
-        f"👥  Total Groups: **{group_count}**\n"
+        f"👤 Total Users:  **{uc}**\n"
+        f"👥 Total Groups: **{gc}**\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
 @Client.on_message(filters.command("maintenance") & admin_filter)
 async def maintenance_cmd(client: Client, message: Message):
     if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
-        return await message.reply("⚠️  Usage: `/maintenance on` or `/maintenance off`")
-
+        return await message.reply("⚠️ Usage: `/maintenance on` or `/maintenance off`")
     state.maintenance_mode = message.command[1].lower() == "on"
     status = "🔴 ON" if state.maintenance_mode else "🟢 OFF"
-    await message.reply(f"🔧  **Maintenance Mode:** {status}")
+    await message.reply(f"🔧 **Maintenance Mode:** {status}")
 
 @Client.on_message(filters.command("reset_stats") & admin_filter)
 async def reset_stats_cmd(client: Client, message: Message):
     if len(message.command) < 2:
-        return await message.reply("⚠️  Usage: `/reset_stats <user_id>`")
+        return await message.reply("⚠️ Usage: `/reset_stats <user_id>`")
     try:
         uid = int(message.command[1])
     except ValueError:
-        return await message.reply("⚠️  Invalid user ID!")
-
+        return await message.reply("⚠️ Invalid user ID!")
     await reset_stats(uid)
-    await message.reply(f"✅  Stats reset for user `{uid}`")
+    await message.reply(f"✅ Stats reset for user `{uid}`")
 
 @Client.on_message(filters.command("db_stats") & admin_filter)
 async def db_stats_cmd(client: Client, message: Message):
-    user_count  = await get_user_count()
-    group_count = await get_group_count()
-    match_count = await matches_col.count_documents({})
-
+    uc = await get_user_count()
+    gc = await get_group_count()
+    mc = await matches_col.count_documents({})
     await message.reply(
-        f"🗄️  **Database Info**\n"
+        f"🗄️ **Database Info**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤  Users:   **{user_count}**\n"
-        f"👥  Groups:  **{group_count}**\n"
-        f"🏏  Matches Logged: **{match_count}**\n"
+        f"👤 Users:          **{uc}**\n"
+        f"👥 Groups:         **{gc}**\n"
+        f"🏏 Matches Logged: **{mc}**\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
+# ── Group-admin commands ──────────────────────────────────────────────────────
+
 @Client.on_message(filters.command("end_match") & filters.group)
 async def end_match_admin(client: Client, message: Message):
-    """Allow group admins or bot owner to force-end any running match."""
-    try:
-        member = await client.get_chat_member(message.chat.id, message.from_user.id)
-        is_group_admin = member.status in ADMIN_STATUSES
-    except Exception:
-        is_group_admin = False
-
-    if not (is_group_admin or message.from_user.id == Config.ADMIN_ID):
-        return await message.reply("🔒  Only group admins or bot owner can end a match!")
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id) \
+            and message.from_user.id != Config.ADMIN_ID:
+        return await message.reply("🔒 Only group admins or bot owner can end a match!")
 
     chat_id = message.chat.id
-    ended = False
+    ended   = False
 
-    solo_match = state.solo_matches.pop(chat_id, None)
-    if solo_match:
-        state.pending_bowl.pop(solo_match.current_bowler_id, None)
+    solo = state.solo_matches.pop(chat_id, None)
+    if solo:
+        state.pending_bowl.pop(solo.current_bowler_id, None)
         ended = True
 
-    team_match = state.team_matches.pop(chat_id, None)
-    if team_match:
-        state.pending_bowl.pop(team_match.current_bowler, None)
+    team = state.team_matches.pop(chat_id, None)
+    if team:
+        state.pending_bowl.pop(team.current_bowler, None)
         ended = True
 
     if chat_id in state.tournaments:
@@ -118,6 +116,31 @@ async def end_match_admin(client: Client, message: Message):
         ended = True
 
     if ended:
-        await message.reply("🛑  **Match Ended!** All active games in this group have been stopped.")
+        await message.reply("🛑 **Match Ended!** All active games stopped.")
     else:
-        await message.reply("ℹ️  No active match running in this group.")
+        await message.reply("ℹ️ No active match in this group.")
+
+@Client.on_message(filters.command("spamfree") & filters.group)
+async def spamfree_cmd(client: Client, message: Message):
+    """Toggle spam-free mode for this group.
+    When ON: bowlers cannot bowl the same number twice in a row.
+    Any group admin (or bot owner) can toggle it.
+    """
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id) \
+            and message.from_user.id != Config.ADMIN_ID:
+        return await message.reply("🔒 Only group admins can toggle Spam-Free mode!")
+
+    chat_id = message.chat.id
+    if chat_id in state.spam_free_chats:
+        state.spam_free_chats.discard(chat_id)
+        await message.reply(
+            "🟢 **Spam-Free Mode: OFF**\n\n"
+            "Bowlers can now repeat numbers."
+        )
+    else:
+        state.spam_free_chats.add(chat_id)
+        await message.reply(
+            "🔴 **Spam-Free Mode: ON**\n\n"
+            "Bowlers cannot send the same number twice in a row.\n"
+            "Example: 5, 5 ✗ — 5, 2 ✓"
+        )
