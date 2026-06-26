@@ -23,7 +23,7 @@ async def choose_team_mode(client: Client, cb: CallbackQuery):
         f"👥  **TEAM MATCH STARTED!**\n\n"
         f"👑  **Host:** {cb.from_user.full_name}\n\n"
         f"➡️  Host, type `/create_teams` to open team joining!\n"
-        f"💡  *Tip: Host can also join a team and play!*"
+        f"💡  Tip: Host can also join a team and play!"
     )
     await cb.answer()
 
@@ -58,7 +58,7 @@ async def create_teams_cmd(client: Client, message: Message):
         "🔴  **Team A** — 0 players\n"
         "🔵  **Team B** — 0 players\n\n"
         "Tap below to pick your side! 👇\n"
-        "💡  *Host can join too!*",
+        "💡  Host can join too!",
         reply_markup=kb
     )
     match.join_a_msg_id = msg.id
@@ -210,9 +210,11 @@ async def set_cap_a(client: Client, cb: CallbackQuery):
     if cb.from_user.id != uid:
         return await cb.answer("🔒  Only that player can confirm as captain!", show_alert=True)
     match = team_matches.get(chat_id)
+    if not match:
+        return await cb.answer("⚠️ Match no longer active.", show_alert=True)
     match.cap_a = uid
-    await cb.message.edit_text(f"🔴  **Team A Captain:** {match.team_a[uid].full_name} 👑")
-    await cb.answer("✅  You're the Captain!")
+    await cb.message.edit_text(f"🔴 **Team A Captain:** {match.team_a[uid].full_name} 👑")
+    await cb.answer("✅ You're the Captain!")
     await check_both_captains(client, chat_id)
 
 @Client.on_callback_query(filters.regex("^capB_"))
@@ -222,13 +224,17 @@ async def set_cap_b(client: Client, cb: CallbackQuery):
     if cb.from_user.id != uid:
         return await cb.answer("🔒  Only that player can confirm as captain!", show_alert=True)
     match = team_matches.get(chat_id)
+    if not match:
+        return await cb.answer("⚠️ Match no longer active.", show_alert=True)
     match.cap_b = uid
-    await cb.message.edit_text(f"🔵  **Team B Captain:** {match.team_b[uid].full_name} 👑")
-    await cb.answer("✅  You're the Captain!")
+    await cb.message.edit_text(f"🔵 **Team B Captain:** {match.team_b[uid].full_name} 👑")
+    await cb.answer("✅ You're the Captain!")
     await check_both_captains(client, chat_id)
 
 async def check_both_captains(client: Client, chat_id: int):
     match = team_matches.get(chat_id)
+    if not match:
+        return
     if match.cap_a and match.cap_b:
         await do_toss(client, chat_id)
 
@@ -274,11 +280,13 @@ async def toss_choice(client: Client, cb: CallbackQuery):
     ))
     await cb.answer()
 
-    bat_cap_id = match.cap_a if match.batting_team == "A" else match.cap_b
-    bat_cap_name = (match.team_a if match.batting_team == "A" else match.team_b)[bat_cap_id].full_name
+    bat_cap_id  = match.cap_a if match.batting_team == "A" else match.cap_b
+    bat_team    = match.team_a if match.batting_team == "A" else match.team_b
+    bat_cap_name= bat_team[bat_cap_id].full_name
     await client.send_message(
         chat_id,
-        f"📏  **{bat_cap_name}**, set the number of overs!\nUse `/set_overs <number>`"
+        f"📏 [{bat_cap_name}](tg://user?id={bat_cap_id}) (batting captain) — set overs!\n"
+        f"Use: `/set_overs 2` (recommended: 1–5 overs)"
     )
 
 @Client.on_message(filters.command("set_overs") & filters.group)
@@ -298,5 +306,16 @@ async def set_overs_cmd(client: Client, message: Message):
     await message.reply(f"🏏  **{match.overs} overs match!** Let the game begin! 🔥")
 
     bowl_cap_id = match.cap_a if match.bowling_team == "A" else match.cap_b
-    bowl_cap_name = (match.team_a if match.bowling_team == "A" else match.team_b)[bowl_cap_id].full_name
-    await message.reply(f"🎯  **{bowl_cap_name}**, choose your bowler!\nUse `/bowling` (reply to player)")
+    bowl_team   = match.team_a if match.bowling_team == "A" else match.team_b
+    bat_cap_id  = match.cap_a if match.batting_team == "A" else match.cap_b
+    bat_team    = match.team_a if match.batting_team == "A" else match.team_b
+    bowl_cap    = bowl_team[bowl_cap_id]
+    bat_cap     = bat_team[bat_cap_id]
+    await message.reply(
+        f"✅ **{match.overs} overs per innings set!**\n\n"
+        f"**Next steps:**\n"
+        f"1️⃣ [{bowl_cap.full_name}](tg://user?id={bowl_cap_id}) (bowling captain) →\n"
+        f"   Reply to your bowler + type `/bowling`\n\n"
+        f"2️⃣ [{bat_cap.full_name}](tg://user?id={bat_cap_id}) (batting captain) →\n"
+        f"   Reply to your opener + type `/batting`"
+    )

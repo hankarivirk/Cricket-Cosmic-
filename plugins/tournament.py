@@ -1,5 +1,4 @@
-import itertools
-import string
+import itertools, string
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message
@@ -7,196 +6,119 @@ from config import Config
 from utils.state import tournaments, Tournament, TournamentTeam, GamePhase
 from utils.gifs import send_trophy_gif
 
-ADMIN_STATUSES  = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-TEAM_LABELS     = list(string.ascii_uppercase)   # A, B, C … Z
-MAX_TEAMS       = 8
+ADMIN_S   = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+LABELS    = list(string.ascii_uppercase)
+MAX_TEAMS = 8
+
+async def _is_admin(client, cid, uid):
+    try: return (await client.get_chat_member(cid, uid)).status in ADMIN_S
+    except: return False
 
 @Client.on_message(filters.command("tournament") & filters.group)
-async def tournament_start_cmd(client: Client, message: Message):
-    chat_id = message.chat.id
-    if chat_id in tournaments:
-        return await message.reply("⚠️ Ek tournament already chal raha hai is group mein!")
-
-    # ── Parse optional args: /tournament [num_teams] [team_size] ─────────────
-    args      = message.command[1:]
-    num_teams = 3
-    team_size = 3
+async def cmd_tournament(client, msg: Message):
+    cid = msg.chat.id
+    if cid in tournaments: return await msg.reply("⚠️ Tournament already running!")
+    args = msg.command[1:]; num, size = 3, 3
     try:
-        if len(args) >= 1:
-            num_teams = int(args[0])
-        if len(args) >= 2:
-            team_size = int(args[1])
+        if len(args) >= 1: num  = int(args[0])
+        if len(args) >= 2: size = int(args[1])
     except ValueError:
-        return await message.reply(
-            "⚠️ Usage: `/tournament` or `/tournament <teams> <size>`\n"
-            "Example: `/tournament 4 5` → 4 teams, 5 players each"
-        )
-
-    if not (2 <= num_teams <= MAX_TEAMS):
-        return await message.reply(f"⚠️ Teams must be between 2 and {MAX_TEAMS}!")
-    if not (1 <= team_size <= 20):
-        return await message.reply("⚠️ Team size must be between 1 and 20!")
-
-    t = Tournament(chat_id=chat_id, host_id=message.from_user.id,
-                   team_size=team_size, phase=GamePhase.JOINING)
-
-    labels = TEAM_LABELS[:num_teams]
-    for label in labels:
-        t.teams[label] = TournamentTeam(name=f"Team {label}")
-    tournaments[chat_id] = t
-
-    join_cmds = "  ".join(f"`/t_join_{k}`" for k in labels)
-    await message.reply(
+        return await msg.reply("⚠️ Usage: `/tournament` or `/tournament <teams> <size>`\nExample: `/tournament 4 5`")
+    if not 2 <= num <= MAX_TEAMS: return await msg.reply(f"⚠️ Teams: 2–{MAX_TEAMS}!")
+    if not 1 <= size <= 20:       return await msg.reply("⚠️ Size: 1–20!")
+    labels = LABELS[:num]
+    t = Tournament(chat_id=cid, host_id=msg.from_user.id, team_size=size, phase=GamePhase.JOINING)
+    for lb in labels: t.teams[lb] = TournamentTeam(name=f"Team {lb}")
+    tournaments[cid] = t
+    cmds = "  ".join(f"`/t_join_{k}`" for k in labels)
+    await msg.reply(
         f"🏆 **TOURNAMENT STARTED!**\n\n"
-        f"👑 **Host:** {message.from_user.full_name}\n"
-        f"🏟️ **Teams:** {num_teams}  |  👥 **Size:** {team_size} players/team\n\n"
-        f"Join commands:\n{join_cmds}\n\n"
-        f"Host types `/t_start` once all teams are filled.\n"
-        f"Host can join too! 💪"
-    )
+        f"👑 Host: {msg.from_user.full_name}\n"
+        f"🏟️ {num} teams  |  👥 {size} players/team\n\n"
+        f"Join your team:\n{cmds}\n\n"
+        f"Host starts with `/t_start` once teams are filled.")
 
-async def _join_tournament_team(client, message: Message, team_key: str):
-    t = tournaments.get(message.chat.id)
-    if not t or t.phase != GamePhase.JOINING:
-        return await message.reply("⚠️ No tournament joining open!")
-    if team_key not in t.teams:
-        return await message.reply(f"⚠️ Team {team_key} doesn't exist in this tournament!")
+async def _join(client, msg: Message, key: str):
+    t = tournaments.get(msg.chat.id)
+    if not t or t.phase != GamePhase.JOINING: return await msg.reply("⚠️ No tournament joining open!")
+    if key not in t.teams: return await msg.reply(f"⚠️ Team {key} doesn't exist!")
+    uid  = msg.from_user.id; name = msg.from_user.full_name
+    for k, tm in t.teams.items():
+        if uid in tm.players: return await msg.reply(f"✅ Already in **Team {k}**!")
+    team = t.teams[key]
+    if len(team.players) >= t.team_size: return await msg.reply(f"⚠️ Team {key} full! ({t.team_size} max)")
+    team.players[uid] = name
+    await msg.reply(f"✅ **{name}** joined **Team {key}**! ({len(team.players)}/{t.team_size})")
 
-    user = message.from_user
-    for key, team in t.teams.items():
-        if user.id in team.players:
-            return await message.reply(f"✅ Tu already **Team {key}** mein hai!")
+# ── Register /t_join_A … /t_join_H in module namespace so Pyrogram finds them ─
+def _make(label):
+    async def _h(client, msg: Message): await _join(client, msg, label)
+    _h.__name__ = f"t_join_{label}"
+    return Client.on_message(filters.command(f"t_join_{label}") & filters.group)(_h)
 
-    team = t.teams[team_key]
-    if len(team.players) >= t.team_size:
-        return await message.reply(f"⚠️ Team {team_key} full hai! (Max {t.team_size})")
-
-    team.players[user.id] = user.full_name
-    await message.reply(
-        f"✅ **{user.full_name}** joined **Team {team_key}**! "
-        f"({len(team.players)}/{t.team_size})"
-    )
-
-# ── Dynamic join handlers (A–H) ───────────────────────────────────────────────
-for _label in TEAM_LABELS[:MAX_TEAMS]:
-    def _make_handler(label):
-        @Client.on_message(filters.command(f"t_join_{label}") & filters.group)
-        async def _handler(client: Client, message: Message, _l=label):
-            await _join_tournament_team(client, message, _l)
-        _handler.__name__ = f"t_join_{label}_cmd"
-        return _handler
-    _make_handler(_label)
-
-@Client.on_message(filters.command("t_score") & filters.group)
-async def t_score_cmd(client: Client, message: Message):
-    t = tournaments.get(message.chat.id)
-    if not t:
-        return await message.reply("⚠️ No active tournament!")
-
-    lines = ["🏆 **TOURNAMENT STANDINGS**", "━━━━━━━━━━━━━━━━━━━━"]
-    for i, team in enumerate(sorted(t.teams.values(), key=lambda x: x.points, reverse=True), 1):
-        players = ", ".join(team.players.values()) or "—"
-        lines.append(
-            f"{i}. **{team.name}** — {team.points} pts ({team.wins} wins)\n"
-            f"     Players: {players}"
-        )
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    await message.reply("\n".join(lines))
+for _lb in LABELS[:MAX_TEAMS]:
+    globals()[f"t_join_{_lb}"] = _make(_lb)
 
 @Client.on_message(filters.command("t_members") & filters.group)
-async def t_members_cmd(client: Client, message: Message):
-    t = tournaments.get(message.chat.id)
-    if not t:
-        return await message.reply("⚠️ No active tournament!")
-    lines = [f"👥 **TOURNAMENT TEAMS** ({t.team_size} per team)", "━━━━━━━━━━━━━━━━━━━━"]
-    for key, team in t.teams.items():
-        names = "\n".join(f"  • {n}" for n in team.players.values()) or "  — (empty)"
-        lines.append(f"**{team.name}** ({len(team.players)}/{t.team_size})\n{names}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    await message.reply("\n".join(lines))
+async def cmd_t_members(client, msg: Message):
+    t = tournaments.get(msg.chat.id)
+    if not t: return await msg.reply("⚠️ No tournament!")
+    lines = [f"👥 **Teams** ({t.team_size}/team)", "━━━━━━━━━━━━━━━━━━━━"]
+    for k, tm in t.teams.items():
+        names = "\n".join(f"  • {n}" for n in tm.players.values()) or "  — empty"
+        lines.append(f"**{tm.name}** ({len(tm.players)}/{t.team_size})\n{names}")
+    await msg.reply("\n".join(lines))
+
+@Client.on_message(filters.command("t_score") & filters.group)
+async def cmd_t_score(client, msg: Message):
+    t = tournaments.get(msg.chat.id)
+    if not t: return await msg.reply("⚠️ No tournament!")
+    lines = ["🏆 **STANDINGS**", "━━━━━━━━━━━━━━━━━━━━"]
+    for i, tm in enumerate(sorted(t.teams.values(), key=lambda x: x.points, reverse=True), 1):
+        lines.append(f"{i}. **{tm.name}** — {tm.points} pts ({tm.wins} wins)")
+    await msg.reply("\n".join(lines))
 
 @Client.on_message(filters.command("t_start") & filters.group)
-async def t_start_cmd(client: Client, message: Message):
-    t = tournaments.get(message.chat.id)
-    if not t or message.from_user.id != t.host_id:
-        return await message.reply("🔒 Only the Host can start the tournament!")
-
-    empty = [k for k, team in t.teams.items() if len(team.players) == 0]
-    if empty:
-        return await message.reply(
-            f"⚠️ These teams have no players: {', '.join(empty)}\n"
-            f"Add players or remove empty teams first."
-        )
-
-    keys     = list(t.teams.keys())
-    fixtures = list(itertools.combinations(keys, 2))
-    t.fixtures = fixtures
+async def cmd_t_start(client, msg: Message):
+    t = tournaments.get(msg.chat.id)
+    if not t or msg.from_user.id != t.host_id: return await msg.reply("🔒 Host only!")
+    empty = [k for k, tm in t.teams.items() if len(tm.players) == 0]
+    if empty: return await msg.reply(f"⚠️ Empty teams: {', '.join(empty)}")
+    t.fixtures = list(itertools.combinations(list(t.teams.keys()), 2))
     t.phase    = GamePhase.WAITING
-
-    fixture_text = "\n".join(
-        f"  • {t.teams[a].name} 🆚 {t.teams[b].name}"
-        for a, b in fixtures
-    )
-    await message.reply(
-        f"🏆 **TOURNAMENT FIXTURES (Round Robin)**\n\n"
-        f"{fixture_text}\n\n"
-        f"Start each fixture using `/start` → Team Match.\n"
-        f"Log results with `/t_result <A> <B> <winner>`\n"
-        f"Example: `/t_result A B A` — Team A beat Team B\n\n"
-        f"📊 Check standings: `/t_score`"
-    )
+    lines = [f"🏆 **FIXTURES (Round Robin)**"] + [
+        f"  • {t.teams[a].name} vs {t.teams[b].name}" for a, b in t.fixtures]
+    lines += ["\nLog results: `/t_result A B A` (Team A beat Team B)\n📊 Standings: `/t_score`"]
+    await msg.reply("\n".join(lines))
 
 @Client.on_message(filters.command("t_result") & filters.group)
-async def t_result_cmd(client: Client, message: Message):
-    t = tournaments.get(message.chat.id)
-    if not t or message.from_user.id != t.host_id:
-        return await message.reply("🔒 Only the Host can log results!")
-    if len(message.command) < 4:
-        return await message.reply("⚠️ Usage: `/t_result <TeamA> <TeamB> <Winner>`")
+async def cmd_t_result(client, msg: Message):
+    t = tournaments.get(msg.chat.id)
+    if not t or msg.from_user.id != t.host_id: return await msg.reply("🔒 Host only!")
+    if len(msg.command) < 4: return await msg.reply("⚠️ Usage: `/t_result <A> <B> <winner>`")
+    t1, t2, w = (x.upper() for x in msg.command[1:4])
+    if w not in t.teams: return await msg.reply("⚠️ Invalid winner!")
+    t.teams[w].wins += 1; t.teams[w].points += 2
+    t.results.append((t1, t2, w))
+    await msg.reply(f"✅ **{t.teams[w].name}** wins vs {t.teams.get(t1, type('',(),{'name':t1})()).name}!")
+    if len(t.fixtures) > 0 and len(t.results) >= len(t.fixtures):
+        await _announce(client, msg.chat.id)
 
-    t1, t2, winner = (x.upper() for x in message.command[1:4])
-    if winner not in t.teams:
-        return await message.reply("⚠️ Invalid winner — use team letters (A, B, C...)")
-
-    t.teams[winner].wins   += 1
-    t.teams[winner].points += 2
-    t.results.append((t1, t2, winner))
-
-    await message.reply(
-        f"✅ **Result Logged!**\n\n"
-        f"{t.teams.get(t1, type('', (), {'name': t1})()).name} 🆚 "
-        f"{t.teams.get(t2, type('', (), {'name': t2})()).name} → "
-        f"🏆 **{t.teams[winner].name}** wins!"
-    )
-
-    if len(t.results) >= len(t.fixtures):
-        await _announce_winner(client, message.chat.id)
-
-async def _announce_winner(client, chat_id):
-    t = tournaments.get(chat_id)
-    if not t:
-        return
-    champion = max(t.teams.values(), key=lambda x: x.points)
-    await client.send_message(
-        chat_id,
-        f"🏆🏆🏆 **TOURNAMENT CHAMPIONS!** 🏆🏆🏆\n\n"
-        f"🥇 **{champion.name}** — {champion.points} points!\n\n"
-        f"Players: {', '.join(champion.players.values())}\n\n"
-        f"🎉 Congratulations, legends! 🏏"
-    )
-    await send_trophy_gif(client, chat_id, f"🏆 {champion.name} are the Tournament Champions!")
+async def _announce(client, cid):
+    t = tournaments.get(cid)
+    if not t: return
+    champ = max(t.teams.values(), key=lambda x: x.points)
+    await client.send_message(cid,
+        f"🏆 **TOURNAMENT CHAMPIONS!**\n\n"
+        f"🥇 **{champ.name}** — {champ.points} pts!\n"
+        f"Players: {', '.join(champ.players.values())}\n\n🎉 Congratulations!")
+    await send_trophy_gif(client, cid, f"🏆 {champ.name} — Tournament Champions!")
 
 @Client.on_message(filters.command("t_end") & filters.group)
-async def t_end_cmd(client: Client, message: Message):
-    t = tournaments.get(message.chat.id)
-    if not t:
-        return await message.reply("⚠️ No active tournament!")
-    try:
-        member   = await client.get_chat_member(message.chat.id, message.from_user.id)
-        is_admin = member.status in ADMIN_STATUSES
-    except Exception:
-        is_admin = False
-    if message.from_user.id not in (t.host_id, Config.ADMIN_ID) and not is_admin:
-        return await message.reply("🔒 Only the Host or group admin can end the tournament!")
-    del tournaments[message.chat.id]
-    await message.reply("🛑 **Tournament ended!**")
+async def cmd_t_end(client, msg: Message):
+    t = tournaments.get(msg.chat.id)
+    if not t: return await msg.reply("⚠️ No tournament!")
+    if msg.from_user.id not in (t.host_id, Config.ADMIN_ID) and not await _is_admin(client, msg.chat.id, msg.from_user.id):
+        return await msg.reply("🔒 Host or admin only!")
+    del tournaments[msg.chat.id]
+    await msg.reply("🛑 Tournament ended!")

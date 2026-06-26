@@ -1,427 +1,310 @@
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message
 from config import Config
 from utils.state import team_matches, GamePhase
 import utils.state as state
-from utils.ui import (
-    team_scorecard, team_result_card, bat_prompt, bowl_prompt, bowl_keyboard,
-    dot_ball_msg, century_msg, innings_break_msg
-)
+from utils.ui import team_scorecard, team_result_card, bat_prompt, bowl_prompt, bowl_keyboard, dot_ball_msg, century_msg, innings_break_msg, mention
 from utils.gifs import send_run_gif, send_wicket_gif, send_bowling_prompt_gif, send_trophy_gif
 from database.stats import update_batting_stats, update_bowling_stats, update_motm
 
-ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+ADMIN_S = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
-def _get_team(match, side): return match.team_a if side == "A" else match.team_b
-def _get_cap(match, side):  return match.cap_a  if side == "A" else match.cap_b
+def _team(m, s): return m.team_a if s == "A" else m.team_b
+def _cap(m, s):  return m.cap_a  if s == "A" else m.cap_b
 
-# ── Captain Commands ──────────────────────────────────────────────────────────
+async def _is_admin(client, cid, uid):
+    try: return (await client.get_chat_member(cid, uid)).status in ADMIN_S
+    except: return False
 
 @Client.on_message(filters.command("bowling") & filters.group)
-async def bowling_cmd(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No active match!")
-    if message.from_user.id != _get_cap(match, match.bowling_team):
-        return await message.reply("🔒 Only the bowling captain can choose the bowler!")
-    if not message.reply_to_message:
-        return await message.reply("⚠️ Reply to the player you want to bowl!")
-
-    bowler_id = message.reply_to_message.from_user.id
-    bowling_team = _get_team(match, match.bowling_team)
-    if bowler_id not in bowling_team:
-        return await message.reply("⚠️ That player isn't in the bowling team!")
-
-    match.current_bowler = bowler_id
-    await message.reply(f"🎯 **{bowling_team[bowler_id].full_name}** will bowl this over!")
-
-    batting_team = _get_team(match, match.batting_team)
-    if match.striker is None:
-        bat_cap_id = _get_cap(match, match.batting_team)
-        await client.send_message(
-            message.chat.id,
-            f"🏏 **{batting_team[bat_cap_id].full_name}**, choose your opening batter!\n"
-            f"Use `/batting` (reply to player)"
-        )
+async def cmd_bowling(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m: return await msg.reply("⚠️ No active match!")
+    if msg.from_user.id != _cap(m, m.bowling_team): return await msg.reply("🔒 Bowling captain only!")
+    if not msg.reply_to_message: return await msg.reply("⚠️ Reply to the player you want to bowl!")
+    bid = msg.reply_to_message.from_user.id
+    bt  = _team(m, m.bowling_team)
+    if bid not in bt: return await msg.reply("⚠️ Player not in bowling team!")
+    m.current_bowler = bid
+    await msg.reply(f"🎯 {mention(bid, bt[bid].full_name)} will bowl this over!")
+    if m.striker is None:
+        batt  = _team(m, m.batting_team)
+        bcap  = _cap(m, m.batting_team)
+        await msg.reply(f"👉 {mention(bcap, batt[bcap].full_name)} (batting captain) — choose opener:\n`/batting` (reply to player)")
     else:
-        await start_over(client, message.chat.id)
+        await _start_over(client, msg.chat.id)
 
 @Client.on_message(filters.command("batting") & filters.group)
-async def batting_cmd(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No active match!")
-    if message.from_user.id != _get_cap(match, match.batting_team):
-        return await message.reply("🔒 Only the batting captain can choose the batter!")
-    if not message.reply_to_message:
-        return await message.reply("⚠️ Reply to the player you want to bat!")
+async def cmd_batting(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m: return await msg.reply("⚠️ No active match!")
+    if msg.from_user.id != _cap(m, m.batting_team): return await msg.reply("🔒 Batting captain only!")
+    if not msg.reply_to_message: return await msg.reply("⚠️ Reply to the player you want to bat!")
+    pid = msg.reply_to_message.from_user.id
+    bt  = _team(m, m.batting_team)
+    if pid not in bt: return await msg.reply("⚠️ Player not in batting team!")
+    if bt[pid].is_out: return await msg.reply("⚠️ Player already out!")
 
-    batter_id = message.reply_to_message.from_user.id
-    batting_team = _get_team(match, match.batting_team)
-    if batter_id not in batting_team:
-        return await message.reply("⚠️ That player isn't in the batting team!")
-    if batting_team[batter_id].is_out:
-        return await message.reply("⚠️ That player is already out!")
+    if m.striker is None: m.striker = pid
+    elif m.non_striker is None and pid != m.striker: m.non_striker = pid
+    else: m.striker = pid
 
-    if match.striker is None:
-        match.striker = batter_id
-    elif match.non_striker is None and batter_id != match.striker:
-        match.non_striker = batter_id
-    else:
-        match.striker = batter_id
+    await msg.reply(f"🏏 {mention(pid, bt[pid].full_name)} is on strike!")
 
-    await message.reply(f"🏏 **{batting_team[batter_id].full_name}** is on strike!")
-    if match.current_bowler:
-        await start_over(client, message.chat.id)
+    if m.current_bowler:
+        if m.ball_count > 0:
+            # Mid-over wicket: continue same over, don't reset ball_count
+            await _continue_over(client, msg.chat.id)
+        else:
+            await _start_over(client, msg.chat.id)
 
 @Client.on_message(filters.command("score") & filters.group)
-async def score_cmd(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No active match!")
-    await message.reply(team_scorecard(match))
+async def cmd_score(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m: return await msg.reply("⚠️ No active match!")
+    await msg.reply(team_scorecard(m))
 
 @Client.on_message(filters.command("change_cap") & filters.group)
-async def change_cap_cmd(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match or message.from_user.id != match.host_id:
-        return await message.reply("🔒 Only the Host can transfer captaincy!")
-    if not message.reply_to_message:
-        return await message.reply("⚠️ Reply to the new captain's message!")
-    new_cap = message.reply_to_message.from_user.id
-    if new_cap in match.team_a:
-        match.cap_a = new_cap
-        await message.reply(f"👑 **{match.team_a[new_cap].full_name}** is now Team A Captain!")
-    elif new_cap in match.team_b:
-        match.cap_b = new_cap
-        await message.reply(f"👑 **{match.team_b[new_cap].full_name}** is now Team B Captain!")
-    else:
-        await message.reply("⚠️ Player not found in any team!")
+async def cmd_change_cap(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m or msg.from_user.id != m.host_id: return await msg.reply("🔒 Host only!")
+    if not msg.reply_to_message: return await msg.reply("⚠️ Reply to new captain!")
+    nc = msg.reply_to_message.from_user.id
+    if nc in m.team_a: m.cap_a = nc; await msg.reply(f"👑 {mention(nc, m.team_a[nc].full_name)} is now Team A Captain!")
+    elif nc in m.team_b: m.cap_b = nc; await msg.reply(f"👑 {mention(nc, m.team_b[nc].full_name)} is now Team B Captain!")
+    else: await msg.reply("⚠️ Player not found in any team!")
 
 @Client.on_message(filters.command("end_match") & filters.group)
-async def end_team_match_cmd(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match:
-        return
-    try:
-        member = await client.get_chat_member(message.chat.id, message.from_user.id)
-        is_admin = member.status in ADMIN_STATUSES
-    except Exception:
-        is_admin = False
-    if message.from_user.id != match.host_id and not is_admin:
-        return await message.reply("🔒 Only the Host or group admin can end the match!")
-    state.pending_bowl.pop(match.current_bowler, None)
-    del team_matches[message.chat.id]
-    await message.reply("🛑 **Team match ended!**")
+async def cmd_end_match(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m: return
+    if msg.from_user.id != m.host_id and not await _is_admin(client, msg.chat.id, msg.from_user.id):
+        return await msg.reply("🔒 Host or admin only!")
+    state.pending_bowl.pop(m.current_bowler, None)
+    del team_matches[msg.chat.id]
+    await msg.reply("🛑 Match ended!")
 
-# ── Over / Ball Flow ──────────────────────────────────────────────────────────
+# ── Over Flow ─────────────────────────────────────────────────────────────────
 
-async def start_over(client: Client, chat_id: int):
-    match = team_matches.get(chat_id)
-    if not match:
-        return
-    match.ball_count = 0
-    bowling_team = _get_team(match, match.bowling_team)
-    bowler = bowling_team[match.current_bowler]
+async def _start_over(client, cid):
+    """Call at the START of a new over — resets ball_count to 0."""
+    m = team_matches.get(cid)
+    if not m or not m.current_bowler: return
+    m.ball_count = 0
+    await _send_bowl_prompt(client, cid)
 
-    match.turn_id += 1
-    turn = match.turn_id
-    state.pending_bowl[match.current_bowler] = {"chat_id": chat_id, "kind": "team", "turn_id": turn}
+async def _continue_over(client, cid):
+    """Call after a mid-over wicket — keeps ball_count as-is."""
+    await _send_bowl_prompt(client, cid)
 
-    await send_bowling_prompt_gif(client, chat_id)
-    await client.send_message(
-        chat_id,
-        bowl_prompt(bowler.full_name, 1, 6),
-        reply_markup=bowl_keyboard()     # ← DM button
-    )
-    asyncio.create_task(_bowl_timeout(client, chat_id, match.current_bowler, turn))
+async def _send_bowl_prompt(client, cid):
+    m = team_matches.get(cid)
+    if not m or not m.current_bowler: return
+    bt      = _team(m, m.bowling_team)
+    bowler  = bt[m.current_bowler]
+    m.turn_id += 1; turn = m.turn_id
+    state.pending_bowl[m.current_bowler] = {"chat_id": cid, "kind": "team", "turn_id": turn}
 
-async def _bowl_timeout(client, chat_id, bowler_id, turn):
+    txt = bowl_prompt(
+        m.current_bowler, bowler.full_name,
+        m.ball_count + 1, 6,
+        m.over_count + 1, m.overs)
+    await send_bowling_prompt_gif(client, cid, prompt_text=txt, reply_markup=bowl_keyboard())
+    asyncio.create_task(_bowl_to(client, cid, m.current_bowler, turn))
+
+async def _bowl_to(client, cid, bid, turn):
     await asyncio.sleep(Config.BOWL_TIMEOUT)
-    match = team_matches.get(chat_id)
-    if not match or match.turn_id != turn:
-        return
-    match.turn_id += 1
-    state.pending_bowl.pop(bowler_id, None)
-    bowling_team = _get_team(match, match.bowling_team)
-    name = bowling_team[bowler_id].full_name
-    match.bowler_number = None
-    await client.send_message(chat_id, f"⏱️ **Time's up!** {name} didn't bowl — dot ball!")
-    await _prompt_team_batter(client, chat_id)
+    m = team_matches.get(cid)
+    if not m or m.turn_id != turn: return
+    m.turn_id += 1; state.pending_bowl.pop(bid, None)
+    bt = _team(m, m.bowling_team)
+    await client.send_message(cid, f"⏱️ {mention(bid, bt[bid].full_name)} didn't bowl — dot ball!")
+    m.bowler_number = None
+    await _prompt_batter(client, cid)
 
-async def resolve_team_bowl(client, bowler_id: int, number: int):
-    pending = state.pending_bowl.get(bowler_id)
-    if not pending or pending.get("kind") != "team":
-        return
-    chat_id = pending["chat_id"]
-    match   = team_matches.get(chat_id)
-    if not match or match.turn_id != pending["turn_id"]:
-        state.pending_bowl.pop(bowler_id, None)
-        return
+async def resolve_team_bowl(client, bid, number):
+    p = state.pending_bowl.get(bid)
+    if not p or p.get("kind") != "team": return
+    cid = p["chat_id"]; m = team_matches.get(cid)
+    if not m or m.turn_id != p["turn_id"]: state.pending_bowl.pop(bid, None); return
 
-    # ── Spam-free check ──────────────────────────────────────────────────────
-    if chat_id in state.spam_free_chats:
-        bowling_team = _get_team(match, match.bowling_team)
-        bowler = bowling_team.get(bowler_id)
-        if bowler and bowler.last_bowl_number == number:
-            await client.send_message(
-                bowler_id,
-                f"⛔ **Spam-Free ON!** You already bowled {number} last time.\n"
-                f"Send a different number (1–6)!"
-            )
-            return  # keep pending
+    if cid in state.spam_free_chats:
+        bt = _team(m, m.bowling_team)
+        bw = bt.get(bid)
+        if bw and bw.last_bowl_number == number:
+            await client.send_message(bid, f"⛔ **Spam-Free!** You bowled {number} last time — send different!"); return
 
-    match.turn_id += 1
-    state.pending_bowl.pop(bowler_id, None)
-    match.bowler_number = number
-    bowling_team = _get_team(match, match.bowling_team)
-    if bowler_id in bowling_team:
-        bowling_team[bowler_id].last_bowl_number = number
-    await client.send_message(bowler_id, "✅ Got it! Ball is bowled... 🎯")
-    await _prompt_team_batter(client, chat_id)
+    m.turn_id += 1; state.pending_bowl.pop(bid, None)
+    m.bowler_number = number
+    bt = _team(m, m.bowling_team)
+    if bid in bt: bt[bid].last_bowl_number = number
+    await client.send_message(bid, "✅ Ball bowled! 🎯")
+    await _prompt_batter(client, cid)
 
-async def _prompt_team_batter(client, chat_id):
-    match = team_matches.get(chat_id)
-    if not match:
-        return
-    batting_team = _get_team(match, match.batting_team)
-    striker = batting_team[match.striker]
-    match.turn_id += 1
-    turn = match.turn_id
-    await client.send_message(chat_id, bat_prompt(striker.full_name, match.ball_count + 1))
-    asyncio.create_task(_bat_timeout(client, chat_id, turn))
+async def _prompt_batter(client, cid):
+    m = team_matches.get(cid)
+    if not m or m.striker is None: return
+    bt = _team(m, m.batting_team); striker = bt[m.striker]
+    m.turn_id += 1; turn = m.turn_id
+    await client.send_message(cid, bat_prompt(m.striker, striker.full_name, m.ball_count + 1, 6))
+    asyncio.create_task(_bat_to(client, cid, turn))
 
-async def _bat_timeout(client, chat_id, turn):
+async def _bat_to(client, cid, turn):
     await asyncio.sleep(Config.BAT_TIMEOUT)
-    match = team_matches.get(chat_id)
-    if not match or match.turn_id != turn:
-        return
-    match.turn_id += 1
-    await _resolve_team_ball(client, chat_id, None, timed_out=True)
+    m = team_matches.get(cid)
+    if not m or m.turn_id != turn: return
+    m.turn_id += 1
+    await _resolve_ball(client, cid, None, timed_out=True)
 
-async def resolve_team_bat(client, chat_id, striker_id, number):
-    match = team_matches.get(chat_id)
-    if not match or match.striker != striker_id:
-        return
-    match.turn_id += 1
-    await _resolve_team_ball(client, chat_id, number, timed_out=False)
+async def resolve_team_bat(client, cid, sid, number):
+    m = team_matches.get(cid)
+    if not m or m.striker != sid: return
+    m.turn_id += 1
+    await _resolve_ball(client, cid, number, timed_out=False)
 
-async def _resolve_team_ball(client, chat_id, bat_number, timed_out):
-    match = team_matches.get(chat_id)
-    if not match:
-        return
+async def _resolve_ball(client, cid, bat_num, timed_out):
+    m = team_matches.get(cid)
+    if not m: return
+    btt     = _team(m, m.batting_team); blt = _team(m, m.bowling_team)
+    striker = btt[m.striker]; bowler = blt[m.current_bowler]
+    bowl_n  = m.bowler_number
 
-    batting_team  = _get_team(match, match.batting_team)
-    bowling_team  = _get_team(match, match.bowling_team)
-    striker       = batting_team[match.striker]
-    bowler        = bowling_team[match.current_bowler]
-    bowl_n        = match.bowler_number
+    m.ball_count += 1; bowler.balls_bowled += 1
+    is_wkt = False
 
-    match.ball_count    += 1
-    bowler.balls_bowled += 1
-
-    is_wicket = False
     if timed_out:
-        is_wicket = True
-        await client.send_message(chat_id, "⏱️ **Time's up!** Auto OUT!")
-        await send_wicket_gif(client, chat_id, striker.full_name)
-    elif bowl_n is not None and bat_number == bowl_n:
-        is_wicket = True
-        await send_wicket_gif(client, chat_id, striker.full_name)
+        is_wkt = True
+        await client.send_message(cid, f"⏱️ {mention(m.striker, striker.full_name)} timed out — **OUT!**")
+        await send_wicket_gif(client, cid, m.striker, striker.full_name)
+    elif bowl_n is not None and bat_num == bowl_n:
+        is_wkt = True
+        await send_wicket_gif(client, cid, m.striker, striker.full_name)
     else:
-        runs = bat_number
-        striker.runs  += runs
-        striker.balls += 1
+        runs = bat_num if bat_num is not None else 0
+        striker.runs += runs; striker.balls += 1
         if runs == 4: striker.fours += 1
         elif runs == 6: striker.sixes += 1
         bowler.runs_given += runs
-
-        if match.batting_team == "A":
-            match.team_a_score += runs
-        else:
-            match.team_b_score += runs
-
-        if runs == 0:
-            striker.zeros_this_over += 1
-            await client.send_message(chat_id, dot_ball_msg(striker.full_name))
-        else:
-            await send_run_gif(client, chat_id, runs, striker.full_name)
-
+        if m.batting_team == "A": m.team_a_score += runs
+        else: m.team_b_score += runs
+        if runs == 0: striker.zeros_this_over += 1
+        await send_run_gif(client, cid, runs, m.striker, striker.full_name)
         if striker.runs in (50, 100):
-            await client.send_message(chat_id, century_msg(striker.full_name, striker.runs))
+            await client.send_message(cid, century_msg(m.striker, striker.full_name, striker.runs))
+        if runs % 2 == 1 and m.non_striker:
+            m.striker, m.non_striker = m.non_striker, m.striker
 
-        if runs % 2 == 1 and match.non_striker:
-            match.striker, match.non_striker = match.non_striker, match.striker
+    if is_wkt:
+        striker.is_out = True; bowler.wickets += 1
+        if m.batting_team == "A": m.team_a_wickets += 1
+        else: m.team_b_wickets += 1
+        m.last_3_wickets.append(m.current_bowler)
+        if len(m.last_3_wickets) >= 3 and len(set(m.last_3_wickets[-3:])) == 1:
+            await client.send_message(cid, f"🎩 **HAT-TRICK!** {mention(m.current_bowler, bowler.full_name)} 🔥")
+        m.striker = m.non_striker; m.non_striker = None
 
-    if is_wicket:
-        striker.is_out = True
-        bowler.wickets += 1
-        if match.batting_team == "A":
-            match.team_a_wickets += 1
-        else:
-            match.team_b_wickets += 1
+    m.bowler_number = None
 
-        match.last_3_wickets.append(match.current_bowler)
-        if len(match.last_3_wickets) >= 3 and len(set(match.last_3_wickets[-3:])) == 1:
-            await client.send_message(
-                chat_id,
-                f"🎩 **HAT-TRICK!!!** {bowler.full_name} is on fire! 🔥"
-            )
+    # Target chase win check
+    if m.innings == 2 and m.target:
+        curr = m.team_a_score if m.batting_team == "A" else m.team_b_score
+        if curr >= m.target: return await _finish_match(client, cid)
 
-        match.striker = match.non_striker
-        match.non_striker = None
+    wkts = m.team_a_wickets if m.batting_team == "A" else m.team_b_wickets
+    size = len(_team(m, m.batting_team))
+    all_out   = wkts >= max(size - 1, 1)
+    # ── FIXED: 1 over = 6 balls ──────────────────────────────────────────────
+    over_done = m.ball_count >= 6
 
-    match.bowler_number = None
+    if all_out:
+        return await _end_innings(client, cid)
 
-    # Target chase win
-    if match.innings == 2 and match.target is not None:
-        curr = match.team_a_score if match.batting_team == "A" else match.team_b_score
-        if curr >= match.target:
-            return await _finish_team_match(client, chat_id)
-
-    # Check innings/over end
-    wkts = match.team_a_wickets if match.batting_team == "A" else match.team_b_wickets
-    size = len(_get_team(match, match.batting_team))
-    all_out  = wkts >= max(size - 1, 1)
-    over_done = match.ball_count >= match.overs
-
-    if all_out or over_done:
-        return await _end_innings_or_over(client, chat_id, all_out)
-
-    if match.striker is None:
-        bat_cap_id = _get_cap(match, match.batting_team)
-        batting_team = _get_team(match, match.batting_team)
-        await client.send_message(
-            chat_id,
-            f"🏏 **{batting_team[bat_cap_id].full_name}**, choose next batter!\n"
-            f"Use `/batting` (reply to player)"
-        )
-    else:
-        # Reset per-over zero counter on new over
-        if match.ball_count > 0 and match.ball_count % 6 == 0:
-            for p in _get_team(match, match.batting_team).values():
-                p.zeros_this_over = 0
-        await _prompt_team_batter(client, chat_id)
-
-async def _end_innings_or_over(client, chat_id, all_out):
-    match = team_matches.get(chat_id)
-    if not match:
+    if over_done:
+        m.over_count += 1
+        m.ball_count  = 0
+        # Reset dot-ball counters for next over
+        for p in _team(m, m.batting_team).values():
+            p.zeros_this_over = 0
+        if m.over_count >= m.overs:
+            return await _end_innings(client, cid)
+        # More overs — new bowler needed
+        m.current_bowler = None
+        bwl_cap = _cap(m, m.bowling_team); bwlt = _team(m, m.bowling_team)
+        await client.send_message(cid,
+            f"📋 **Over {m.over_count} complete!**\n\n"
+            f"👉 {mention(bwl_cap, bwlt[bwl_cap].full_name)} (bowling captain) — choose next bowler:\n`/bowling` (reply to player)")
         return
 
-    if all_out or match.ball_count >= match.overs:
-        if match.innings == 1:
-            score          = match.team_a_score if match.batting_team == "A" else match.team_b_score
-            wkts           = match.team_a_wickets if match.batting_team == "A" else match.team_b_wickets
-            match.target   = score + 1
-            match.innings  = 2
-            old_bat        = match.batting_team
-            match.batting_team, match.bowling_team = match.bowling_team, match.batting_team
-            match.striker  = match.non_striker = None
-            match.current_bowler = None
-            match.ball_count = 0
-
-            batting_team = _get_team(match, old_bat)
-            old_cap_id   = _get_cap(match, old_bat)
-            await client.send_message(
-                chat_id,
-                innings_break_msg(batting_team[old_cap_id].full_name, score, wkts, match.target)
-            )
-            bowl_cap_id   = _get_cap(match, match.bowling_team)
-            bowling_team  = _get_team(match, match.bowling_team)
-            await client.send_message(
-                chat_id,
-                f"🎯 **{bowling_team[bowl_cap_id].full_name}**, choose your bowler!\nUse `/bowling`"
-            )
-        else:
-            await _finish_team_match(client, chat_id)
+    if m.striker is None:
+        bat_cap = _cap(m, m.batting_team); batt = _team(m, m.batting_team)
+        await client.send_message(cid,
+            f"👉 {mention(bat_cap, batt[bat_cap].full_name)} (batting captain) — choose next batter:\n`/batting` (reply to player)")
     else:
-        match.current_bowler = None
-        bowl_cap_id  = _get_cap(match, match.bowling_team)
-        bowling_team = _get_team(match, match.bowling_team)
-        await client.send_message(
-            chat_id,
-            f"📋 **Over complete!**\n\n"
-            f"🎯 **{bowling_team[bowl_cap_id].full_name}**, choose next bowler!\nUse `/bowling`"
-        )
+        await _prompt_batter(client, cid)
 
-async def _finish_team_match(client, chat_id):
-    match = team_matches.get(chat_id)
-    if not match:
-        return
-    match.phase = GamePhase.FINISHED
-    state.pending_bowl.pop(match.current_bowler, None)
-
-    if match.team_a_score > match.team_b_score:
-        winner = "🔴 Team A"
-    elif match.team_b_score > match.team_a_score:
-        winner = "🔵 Team B"
+async def _end_innings(client, cid):
+    m = team_matches.get(cid)
+    if not m: return
+    if m.innings == 1:
+        score = m.team_a_score if m.batting_team == "A" else m.team_b_score
+        wkts  = m.team_a_wickets if m.batting_team == "A" else m.team_b_wickets
+        m.target = score + 1; m.innings = 2
+        old_bat  = m.batting_team
+        m.batting_team, m.bowling_team = m.bowling_team, m.batting_team
+        m.striker = m.non_striker = m.current_bowler = None
+        m.ball_count = m.over_count = 0
+        old_batt = _team(m, old_bat); old_cap = _cap(m, old_bat)
+        await client.send_message(cid, innings_break_msg(old_batt[old_cap].full_name, score, wkts, m.target))
+        bwl_cap = _cap(m, m.bowling_team); bwlt = _team(m, m.bowling_team)
+        bat_cap = _cap(m, m.batting_team); batt  = _team(m, m.batting_team)
+        await client.send_message(cid,
+            f"👉 {mention(bwl_cap, bwlt[bwl_cap].full_name)} (bowling captain) — choose bowler:\n`/bowling` (reply to player)\n\n"
+            f"👉 {mention(bat_cap, batt[bat_cap].full_name)} (batting captain) — choose opener:\n`/batting` (reply to player)")
     else:
-        winner = "🤝 Tied"
+        await _finish_match(client, cid)
 
-    all_players = {**match.team_a, **match.team_b}
-    motm = max(all_players.values(), key=lambda p: p.runs + p.wickets * 15) if all_players else None
-
-    await client.send_message(chat_id, team_result_card(match, winner, motm.full_name if motm else "N/A"))
-    if motm:
-        await send_trophy_gif(client, chat_id, f"⭐ **Player of the Match:** {motm.full_name}")
-
-    won_side = "A" if "Team A" in winner else ("B" if "Team B" in winner else None)
-    for side, team_dict in [("A", match.team_a), ("B", match.team_b)]:
-        for p in team_dict.values():
-            await update_batting_stats(
-                p.user_id, p.full_name, p.runs, p.balls, p.fours, p.sixes,
-                p.is_out, won=(side == won_side)
-            )
+async def _finish_match(client, cid):
+    m = team_matches.get(cid)
+    if not m: return
+    m.phase = GamePhase.FINISHED; state.pending_bowl.pop(m.current_bowler, None)
+    winner = "🔴 Team A" if m.team_a_score > m.team_b_score else ("🔵 Team B" if m.team_b_score > m.team_a_score else "🤝 Tied")
+    all_p  = {**m.team_a, **m.team_b}
+    motm   = max(all_p.values(), key=lambda p: p.runs + p.wickets * 15) if all_p else None
+    await client.send_message(cid, team_result_card(m, winner, motm.full_name if motm else "N/A"))
+    if motm: await send_trophy_gif(client, cid, f"⭐ **Player of the Match:** {mention(motm.user_id, motm.full_name)}")
+    won = "A" if "Team A" in winner else ("B" if "Team B" in winner else None)
+    for side, td in [("A", m.team_a), ("B", m.team_b)]:
+        for p in td.values():
+            await update_batting_stats(p.user_id, p.full_name, p.runs, p.balls, p.fours, p.sixes, p.is_out, won=(side==won))
             if p.balls_bowled > 0:
-                await update_bowling_stats(
-                    p.user_id, p.full_name, p.wickets, p.runs_given, p.balls_bowled, p.wickets >= 3
-                )
-    if motm:
-        await update_motm(motm.user_id, motm.full_name)
+                await update_bowling_stats(p.user_id, p.full_name, p.wickets, p.runs_given, p.balls_bowled, p.wickets >= 3)
+    if motm: await update_motm(motm.user_id, motm.full_name)
+    del team_matches[cid]
 
-    del team_matches[chat_id]
+# ── Input handlers ────────────────────────────────────────────────────────────
 
-# ── Input Handlers ────────────────────────────────────────────────────────────
-
-def _team_bowl_pending(_, __, m: Message) -> bool:
-    return bool(m.from_user) and state.pending_bowl.get(m.from_user.id, {}).get("kind") == "team"
-
-def _team_bat_turn(_, __, m: Message) -> bool:
+def _tbp(_, __, m): return bool(m.from_user) and state.pending_bowl.get(m.from_user.id, {}).get("kind") == "team"
+def _tbt(_, __, m):
     match = team_matches.get(getattr(m.chat, "id", None))
-    return bool(
-        match and match.striker is not None
-        and m.from_user and m.from_user.id == match.striker
-    )
+    return bool(match and match.striker and m.from_user and m.from_user.id == match.striker)
 
-team_bowl_filter = filters.create(_team_bowl_pending)
-team_bat_filter  = filters.create(_team_bat_turn)
+@Client.on_message(filters.private & filters.regex(r"^\s*\d{1,2}\s*$") & filters.create(_tbp))
+async def on_team_bowl(client, msg: Message):
+    n = int(msg.text.strip())
+    if not 1 <= n <= 6: return await msg.reply("⚠️ 1 se 6 ke beech number bhejo!")
+    await resolve_team_bowl(client, msg.from_user.id, n)
 
-@Client.on_message(filters.private & filters.regex(r"^\s*\d{1,3}\s*$") & team_bowl_filter)
-async def team_bowl_dm_input(client: Client, message: Message):
-    number = int(message.text.strip())
-    if not (1 <= number <= 6):
-        return await message.reply("⚠️ Send a number between 1–6!")
-    await resolve_team_bowl(client, message.from_user.id, number)
-
-@Client.on_message(filters.group & filters.regex(r"^\s*\d{1,3}\s*$") & team_bat_filter)
-async def team_bat_group_input(client: Client, message: Message):
-    match = team_matches.get(message.chat.id)
-    if not match or match.current_bowler is None:
-        return
-    number = int(message.text.strip())
-    if not (1 <= number <= 6):
-        return
-
-    # ── Dot-ball spam limit ─────────────────────────────────────────────────
-    if number == 0:
-        batting_team = _get_team(match, match.batting_team)
-        striker = batting_team.get(message.from_user.id)
+@Client.on_message(filters.group & filters.regex(r"^\s*\d{1,2}\s*$") & filters.create(_tbt))
+async def on_team_bat(client, msg: Message):
+    m = team_matches.get(msg.chat.id)
+    if not m or not m.current_bowler: return
+    n = int(msg.text.strip())
+    if n == 0:
+        btt = _team(m, m.batting_team); striker = btt.get(msg.from_user.id)
         if striker and striker.zeros_this_over >= Config.MAX_ZEROS_PER_OVER:
-            return await message.reply(
-                f"⛔ Max {Config.MAX_ZEROS_PER_OVER} dot balls per over!\n"
-                f"Send a number between **1–6**."
-            )
-
-    await resolve_team_bat(client, message.chat.id, message.from_user.id, number)
+            return await msg.reply(f"⛔ Max {Config.MAX_ZEROS_PER_OVER} dot balls per over! Send 1–6.")
+    elif not 1 <= n <= 6:
+        return
+    await resolve_team_bat(client, msg.chat.id, msg.from_user.id, n)

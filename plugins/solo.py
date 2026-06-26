@@ -1,470 +1,338 @@
-import asyncio
-import random
+import asyncio, random
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from config import Config
 from utils.state import solo_matches, SoloMatch, PlayerScore, GamePhase
 import utils.state as state
-from utils.ui import (
-    solo_scorecard, solo_result_card, bat_prompt, bowl_prompt, bowl_keyboard,
-    dot_ball_msg, century_msg
-)
-from utils.gifs import (
-    send_run_gif, send_wicket_gif, send_bowling_prompt_gif,
-    send_match_start_gif, send_trophy_gif
-)
+from utils.ui import solo_scorecard, solo_result_card, bat_prompt, bowl_prompt, bowl_keyboard, dot_ball_msg, century_msg, mention
+from utils.gifs import send_run_gif, send_wicket_gif, send_bowling_prompt_gif, send_match_start_gif, send_trophy_gif
 from database.stats import update_batting_stats, update_bowling_stats, update_motm
 
-ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+ADMIN_S = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
-async def is_group_admin(client, chat_id: int, user_id: int) -> bool:
+async def _is_admin(client, chat_id, uid):
     try:
-        member = await client.get_chat_member(chat_id, user_id)
-        return member.status in ADMIN_STATUSES
-    except Exception:
-        return False
+        return (await client.get_chat_member(chat_id, uid)).status in ADMIN_S
+    except: return False
 
-# ── Mode menu (called from plugins/start.py — NOT a handler itself) ───────────
-
-async def show_mode_menu(client: Client, message: Message):
-    chat_id = message.chat.id
-    if chat_id in solo_matches or chat_id in state.team_matches:
+# ── Mode menu (called from start.py) ─────────────────────────────────────────
+async def show_mode_menu(client, message):
+    cid = message.chat.id
+    if cid in solo_matches or cid in state.team_matches:
         return await message.reply("⚠️ Ek match already chal raha hai is group mein!")
-
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🧍 Solo Match", callback_data=f"mode_solo_{message.from_user.id}"),
         InlineKeyboardButton("👥 Team Match", callback_data=f"mode_team_{message.from_user.id}"),
     ]])
-    await message.reply(
-        "🏏 **Choose Your Battle!**\n\n"
-        "🧍 **Solo Match** — Every man for himself.\n"
-        "👥 **Team Match** — Two sides, one champion.",
-        reply_markup=kb
-    )
+    await message.reply("🏏 **Choose Your Battle!**\n\n🧍 **Solo** — Every man for himself.\n👥 **Team** — Two sides, one champion.", reply_markup=kb)
 
 @Client.on_callback_query(filters.regex("^mode_solo_"))
-async def choose_solo_mode(client: Client, cb: CallbackQuery):
-    host_id = int(cb.data.split("_")[-1])
-    if cb.from_user.id != host_id:
-        return await cb.answer("🔒 Sirf match starter choose kar sakta hai!", show_alert=True)
-
+async def cb_mode_solo(client, cb: CallbackQuery):
+    hid = int(cb.data.split("_")[-1])
+    if cb.from_user.id != hid: return await cb.answer("🔒 Sirf starter choose kar sakta hai!", show_alert=True)
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("3 Balls/Over", callback_data=f"soloovers_3_{host_id}"),
-        InlineKeyboardButton("6 Balls/Over", callback_data=f"soloovers_6_{host_id}"),
+        InlineKeyboardButton("3 Balls", callback_data=f"soloovers_3_{hid}"),
+        InlineKeyboardButton("6 Balls", callback_data=f"soloovers_6_{hid}"),
     ]])
-    await cb.message.edit_text("🧍 **Solo Match**\n\nChoose balls per over 👇", reply_markup=kb)
+    await cb.message.edit_text("🧍 **Solo Match**\n\nHar player ko kitni balls milegi?", reply_markup=kb)
     await cb.answer()
 
 @Client.on_callback_query(filters.regex("^soloovers_"))
-async def solo_set_overs(client: Client, cb: CallbackQuery):
-    _, overs, host_id = cb.data.split("_")
-    overs, host_id = int(overs), int(host_id)
-    if cb.from_user.id != host_id:
-        return await cb.answer("🔒 Sirf match starter choose kar sakta hai!", show_alert=True)
-
-    chat_id = cb.message.chat.id
-    match = SoloMatch(chat_id=chat_id, host_id=host_id, overs=overs, phase=GamePhase.JOINING)
-    solo_matches[chat_id] = match
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Join Match", callback_data=f"joinsolo_{chat_id}")]])
+async def cb_solo_overs(client, cb: CallbackQuery):
+    _, overs, hid = cb.data.split("_"); overs, hid = int(overs), int(hid)
+    if cb.from_user.id != hid: return await cb.answer("🔒 Sirf starter choose kar sakta hai!", show_alert=True)
+    cid = cb.message.chat.id
+    match = SoloMatch(chat_id=cid, host_id=hid, overs=overs, phase=GamePhase.JOINING)
+    solo_matches[cid] = match
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Join Match", callback_data=f"joinsolo_{cid}")]])
     msg = await cb.message.edit_text(
-        f"🧍 **SOLO MATCH STARTING!**\n\n"
-        f"🎯 {overs} Ball{'s' if overs > 1 else ''}/Over\n"
-        f"👥 Min {Config.MIN_PLAYERS_SOLO} — Max {Config.MAX_PLAYERS_SOLO} players\n\n"
-        f"⏱️ Joining closes in **2 minutes**\n"
-        f"Tap below or type `/join_solo` to join!",
-        reply_markup=kb
-    )
+        f"🧍 **SOLO MATCH STARTING!**\n\n🎯 {overs} Balls/Player\n👥 Min 2 — Max 20 players\n\nTap below or `/join_solo`",
+        reply_markup=kb)
     match.join_msg_id = msg.id
     await cb.answer()
-    asyncio.create_task(auto_start_timer(client, chat_id))
+    asyncio.create_task(_join_timer(client, cid))
 
-async def auto_start_timer(client: Client, chat_id: int):
+async def _join_timer(client, cid):
     await asyncio.sleep(Config.JOIN_TIMEOUT)
-    match = solo_matches.get(chat_id)
-    if match and match.phase == GamePhase.JOINING:
-        if len(match.players) >= Config.MIN_PLAYERS_SOLO:
-            await begin_solo_match(client, chat_id)
+    m = solo_matches.get(cid)
+    if m and m.phase == GamePhase.JOINING:
+        if len(m.players) >= Config.MIN_PLAYERS_SOLO: await _begin(client, cid)
         else:
-            await client.send_message(
-                chat_id,
-                f"⚠️ **Match Cancelled!** Not enough players (need min {Config.MIN_PLAYERS_SOLO})."
-            )
-            solo_matches.pop(chat_id, None)
+            await client.send_message(cid, "⚠️ **Match Cancelled!** Not enough players.")
+            solo_matches.pop(cid, None)
 
 @Client.on_callback_query(filters.regex("^joinsolo_"))
-async def join_solo_callback(client: Client, cb: CallbackQuery):
-    await _join_solo(client, int(cb.data.split("_")[1]), cb.from_user, cb)
+async def cb_join_solo(client, cb: CallbackQuery):
+    await _do_join(client, int(cb.data.split("_")[1]), cb.from_user, cb)
 
 @Client.on_message(filters.command("join_solo") & filters.group)
-async def join_solo_cmd(client: Client, message: Message):
-    await _join_solo(client, message.chat.id, message.from_user, message)
+async def cmd_join_solo(client, msg: Message):
+    await _do_join(client, msg.chat.id, msg.from_user, msg)
 
-async def _join_solo(client, chat_id, user, ctx):
-    match  = solo_matches.get(chat_id)
-    is_cb  = isinstance(ctx, CallbackQuery)
-    def reply(msg): return ctx.answer(msg, show_alert=True) if is_cb else ctx.reply(msg)
-
-    if not match or match.phase != GamePhase.JOINING:
-        return await reply("⚠️ No joining window open right now!")
-    if user.id in match.players:
-        return await reply("✅ Tu already joined hai!")
-    if len(match.players) >= Config.MAX_PLAYERS_SOLO:
-        return await reply("⚠️ Match full hai!")
-
-    match.players[user.id] = PlayerScore(user_id=user.id, full_name=user.full_name)
-    match.order.append(user.id)
-
-    names = "\n".join(f"  {i+1}. {p.full_name}" for i, p in enumerate(match.players.values()))
+async def _do_join(client, cid, user, ctx):
+    m = solo_matches.get(cid); is_cb = isinstance(ctx, CallbackQuery)
+    def rep(t): return ctx.answer(t, show_alert=True) if is_cb else ctx.reply(t)
+    if not m or m.phase != GamePhase.JOINING: return await rep("⚠️ No joining window open!")
+    if user.id in m.players: return await rep("✅ Already joined!")
+    if len(m.players) >= Config.MAX_PLAYERS_SOLO: return await rep("⚠️ Match full!")
+    m.players[user.id] = PlayerScore(user_id=user.id, full_name=user.full_name)
+    m.order.append(user.id)
+    names = "\n".join(f"  {i+1}. {p.full_name}" for i, p in enumerate(m.players.values()))
     try:
-        await client.edit_message_text(
-            chat_id, match.join_msg_id,
-            f"🧍 **SOLO MATCH — JOINING**\n\n"
-            f"👥 **Players ({len(match.players)}):**\n{names}\n\n"
-            f"Type `/join_solo` to join!",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🙋 Join Match", callback_data=f"joinsolo_{chat_id}")
-            ]])
-        )
-    except Exception:
-        pass
-
-    if is_cb:
-        await ctx.answer("✅ Joined!")
-    else:
-        await ctx.reply(f"✅ **{user.full_name}** joined the match!")
+        await client.edit_message_text(cid, m.join_msg_id,
+            f"🧍 **SOLO — JOINING** ({len(m.players)} players)\n\n{names}\n\nTap to join!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Join", callback_data=f"joinsolo_{cid}")]]))
+    except: pass
+    if is_cb: await ctx.answer("✅ Joined!")
+    else: await ctx.reply(f"✅ {mention(user.id, user.full_name)} joined!")
 
 @Client.on_message(filters.command("leave_solo") & filters.group)
-async def leave_solo_cmd(client: Client, message: Message):
-    match = solo_matches.get(message.chat.id)
-    if not match or match.phase != GamePhase.JOINING:
-        return await message.reply("⚠️ No joining window open!")
-    uid = message.from_user.id
-    if uid not in match.players:
-        return await message.reply("⚠️ Tu joined nahi hai!")
-    del match.players[uid]
-    match.order.remove(uid)
-    await message.reply(f"👋 **{message.from_user.full_name}** left the match.")
+async def cmd_leave(client, msg: Message):
+    m = solo_matches.get(msg.chat.id)
+    if not m or m.phase != GamePhase.JOINING: return await msg.reply("⚠️ No joining window!")
+    uid = msg.from_user.id
+    if uid not in m.players: return await msg.reply("⚠️ Tu joined nahi hai!")
+    del m.players[uid]; m.order.remove(uid)
+    await msg.reply(f"👋 {mention(uid, msg.from_user.full_name)} left.")
 
 @Client.on_message(filters.command("solo_list") & filters.group)
-async def solo_list_cmd(client: Client, message: Message):
-    match = solo_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No active solo match!")
-    names = "\n".join(f"  {i+1}. {p.full_name}" for i, p in enumerate(match.players.values()))
-    await message.reply(f"👥 **Joined Players ({len(match.players)}):**\n{names or 'None yet'}")
+async def cmd_solo_list(client, msg: Message):
+    m = solo_matches.get(msg.chat.id)
+    if not m: return await msg.reply("⚠️ No active solo match!")
+    names = "\n".join(f"  {i+1}. {p.full_name}" for i, p in enumerate(m.players.values()))
+    await msg.reply(f"👥 **Players ({len(m.players)}):**\n{names or 'None'}")
 
 @Client.on_message(filters.command("start_solo") & filters.group)
-async def force_start_solo(client: Client, message: Message):
-    if not await is_group_admin(client, message.chat.id, message.from_user.id):
-        return await message.reply("🔒 Only group admins can force-start!")
-    match = solo_matches.get(message.chat.id)
-    if not match or match.phase != GamePhase.JOINING:
-        return await message.reply("⚠️ No joining window open!")
-    if len(match.players) < Config.MIN_PLAYERS_SOLO:
-        return await message.reply(f"⚠️ Need min {Config.MIN_PLAYERS_SOLO} players!")
-    await begin_solo_match(client, message.chat.id)
-
-@Client.on_message(filters.command("extend_solo") & filters.group)
-async def extend_solo_cmd(client: Client, message: Message):
-    if not await is_group_admin(client, message.chat.id, message.from_user.id):
-        return await message.reply("🔒 Only group admins can extend!")
-    match = solo_matches.get(message.chat.id)
-    if not match or match.phase != GamePhase.JOINING:
-        return await message.reply("⚠️ No joining window open!")
-    await message.reply("⏱️ **Joining time extended by 30 seconds!**")
-    asyncio.create_task(_extend_timer(client, message.chat.id))
-
-async def _extend_timer(client, chat_id):
-    await asyncio.sleep(30)
-    match = solo_matches.get(chat_id)
-    if match and match.phase == GamePhase.JOINING:
-        if len(match.players) >= Config.MIN_PLAYERS_SOLO:
-            await begin_solo_match(client, chat_id)
-        else:
-            await client.send_message(chat_id, "⚠️ **Match Cancelled!** Not enough players.")
-            solo_matches.pop(chat_id, None)
-
-@Client.on_message(filters.command("resume_solo") & filters.group)
-async def resume_solo_cmd(client: Client, message: Message):
-    if not await is_group_admin(client, message.chat.id, message.from_user.id):
-        return await message.reply("🔒 Only group admins can resume!")
-    match = solo_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No interrupted match found!")
-    await message.reply("▶️ **Resuming match...**")
-    await next_ball(client, message.chat.id)
+async def cmd_force_start(client, msg: Message):
+    if not await _is_admin(client, msg.chat.id, msg.from_user.id): return await msg.reply("🔒 Admins only!")
+    m = solo_matches.get(msg.chat.id)
+    if not m or m.phase != GamePhase.JOINING: return await msg.reply("⚠️ No joining window!")
+    if len(m.players) < Config.MIN_PLAYERS_SOLO: return await msg.reply(f"⚠️ Min {Config.MIN_PLAYERS_SOLO} players needed!")
+    await _begin(client, msg.chat.id)
 
 @Client.on_message(filters.command("end_solo") & filters.group)
-async def end_solo_cmd(client: Client, message: Message):
-    if not await is_group_admin(client, message.chat.id, message.from_user.id):
-        return await message.reply("🔒 Only group admins can end the match!")
-    match = solo_matches.pop(message.chat.id, None)
-    if match:
-        state.pending_bowl.pop(match.current_bowler_id, None)
-        await message.reply("🛑 **Solo match ended!**")
-    else:
-        await message.reply("⚠️ No active solo match!")
+async def cmd_end_solo(client, msg: Message):
+    if not await _is_admin(client, msg.chat.id, msg.from_user.id): return await msg.reply("🔒 Admins only!")
+    m = solo_matches.pop(msg.chat.id, None)
+    if m: state.pending_bowl.pop(m.current_bowler_id, None); await msg.reply("🛑 Solo match ended!")
+    else: await msg.reply("⚠️ No active match!")
 
 @Client.on_message(filters.command("solo_score") & filters.group)
-async def solo_score_cmd(client: Client, message: Message):
-    match = solo_matches.get(message.chat.id)
-    if not match:
-        return await message.reply("⚠️ No active solo match!")
-    await message.reply(solo_scorecard([vars(p) for p in match.players.values()], match.overs))
+async def cmd_solo_score(client, msg: Message):
+    m = solo_matches.get(msg.chat.id)
+    if not m: return await msg.reply("⚠️ No active match!")
+    await msg.reply(solo_scorecard([vars(p) for p in m.players.values()], m.overs))
 
-# ── Core Match Flow ───────────────────────────────────────────────────────────
+@Client.on_message(filters.command("extend_solo") & filters.group)
+async def cmd_extend(client, msg: Message):
+    if not await _is_admin(client, msg.chat.id, msg.from_user.id): return await msg.reply("🔒 Admins only!")
+    m = solo_matches.get(msg.chat.id)
+    if not m or m.phase != GamePhase.JOINING: return await msg.reply("⚠️ No joining window!")
+    await msg.reply("⏱️ +30 seconds added!")
+    asyncio.create_task(_ext_timer(client, msg.chat.id))
 
-async def begin_solo_match(client: Client, chat_id: int):
-    match = solo_matches[chat_id]
-    match.phase = GamePhase.BOWLING
-    random.shuffle(match.order)
+async def _ext_timer(client, cid):
+    await asyncio.sleep(30)
+    m = solo_matches.get(cid)
+    if m and m.phase == GamePhase.JOINING:
+        if len(m.players) >= Config.MIN_PLAYERS_SOLO: await _begin(client, cid)
+        else:
+            await client.send_message(cid, "⚠️ Match Cancelled! Not enough players.")
+            solo_matches.pop(cid, None)
 
-    await send_match_start_gif(client, chat_id)
-    await client.send_message(
-        chat_id,
+# ── Core gameplay ─────────────────────────────────────────────────────────────
+
+async def _begin(client, cid):
+    m = solo_matches[cid]
+    m.phase = GamePhase.BOWLING
+    random.shuffle(m.order)
+    await send_match_start_gif(client, cid)
+    await client.send_message(cid,
         f"🏏 **MATCH STARTED!**\n\n"
-        f"👥 {len(match.players)} players ready!\n"
-        f"🎯 {match.overs} ball{'s' if match.overs > 1 else ''} per over\n\n"
-        f"Let the game begin! 🔥"
-    )
-    await next_ball(client, chat_id)
+        f"👥 {len(m.players)} players  |  🎯 {m.overs} balls each\n\n"
+        f"🔥 Let the game begin!")
+    await _next_ball(client, cid)
 
-async def next_ball(client: Client, chat_id: int):
-    match = solo_matches.get(chat_id)
-    if not match:
-        return
-
-    remaining = [uid for uid in match.order if not match.players[uid].is_out]
-    if not remaining:
-        return await finish_solo_match(client, chat_id)
+async def _next_ball(client, cid):
+    m = solo_matches.get(cid)
+    if not m: return
+    remaining = [uid for uid in m.order if not m.players[uid].is_out]
+    if not remaining: return await _finish(client, cid)
 
     batter_id = remaining[0]
-    bowler_candidates = [uid for uid in match.order if uid != batter_id]
-    bowler_id = bowler_candidates[match.current_bowler_idx % len(bowler_candidates)] if bowler_candidates else batter_id
+    batter    = m.players[batter_id]
 
-    match.bowl_number      += 1
-    match.phase             = GamePhase.BOWLING
-    match.current_batter_id = batter_id
-    match.current_bowler_id = bowler_id
-    match.turn_id           += 1
-    turn = match.turn_id
+    # Same bowler for the full over; rotate only when batter changes
+    candidates = [uid for uid in m.order if uid != batter_id]
+    if not candidates:
+        await client.send_message(cid, "⚠️ Not enough players to continue!"); solo_matches.pop(cid, None); return
 
-    state.pending_bowl[bowler_id] = {"chat_id": chat_id, "kind": "solo", "turn_id": turn}
+    bowler_id = candidates[m.current_bowler_idx % len(candidates)]
+    bowler    = m.players[bowler_id]
 
-    bowler = match.players[bowler_id]
-    await send_bowling_prompt_gif(client, chat_id)
-    await client.send_message(
-        chat_id,
-        bowl_prompt(bowler.full_name, match.bowl_number, match.overs),
-        reply_markup=bowl_keyboard()     # ← DM button
-    )
-    asyncio.create_task(_bowl_timeout(client, chat_id, bowler_id, turn))
+    m.bowl_number       += 1
+    m.phase              = GamePhase.BOWLING
+    m.current_batter_id  = batter_id
+    m.current_bowler_id  = bowler_id
+    m.turn_id           += 1
+    turn = m.turn_id
 
-async def _bowl_timeout(client, chat_id, bowler_id, turn):
+    state.pending_bowl[bowler_id] = {"chat_id": cid, "kind": "solo", "turn_id": turn}
+
+    txt = bowl_prompt(bowler_id, bowler.full_name, m.bowl_number, m.overs)
+    await send_bowling_prompt_gif(client, cid, prompt_text=txt, reply_markup=bowl_keyboard())
+    asyncio.create_task(_bowl_timeout(client, cid, bowler_id, turn))
+
+async def _bowl_timeout(client, cid, bowler_id, turn):
     await asyncio.sleep(Config.BOWL_TIMEOUT)
-    match = solo_matches.get(chat_id)
-    if not match or match.turn_id != turn or match.phase != GamePhase.BOWLING:
-        return
-    match.turn_id += 1
+    m = solo_matches.get(cid)
+    if not m or m.turn_id != turn or m.phase != GamePhase.BOWLING: return
+    m.turn_id += 1
     state.pending_bowl.pop(bowler_id, None)
-    bowler = match.players[bowler_id]
+    bowler = m.players[bowler_id]
     bowler.consecutive_penalties += 1
-    bowler.runs_given -= 6
-    match.bowler_number = None
-    await client.send_message(
-        chat_id,
-        f"⏱️ **Time's up!** {bowler.full_name} didn't bowl — dot ball + penalty!"
-    )
-    await _prompt_batter(client, chat_id, match.current_batter_id, bowler_id)
+    m.bowler_number = None
+    await client.send_message(cid, f"⏱️ {mention(bowler_id, bowler.full_name)} didn't bowl in time — dot ball!")
+    await _prompt_batter(client, cid, m.current_batter_id, bowler_id)
 
-async def resolve_solo_bowl(client, bowler_id: int, number: int):
-    pending = state.pending_bowl.get(bowler_id)
-    if not pending or pending.get("kind") != "solo":
-        return
-    chat_id = pending["chat_id"]
-    match   = solo_matches.get(chat_id)
-    if not match or match.turn_id != pending["turn_id"] or match.phase != GamePhase.BOWLING:
-        state.pending_bowl.pop(bowler_id, None)
-        return
+async def resolve_solo_bowl(client, bowler_id, number):
+    p = state.pending_bowl.get(bowler_id)
+    if not p or p.get("kind") != "solo": return
+    cid = p["chat_id"]; m = solo_matches.get(cid)
+    if not m or m.turn_id != p["turn_id"] or m.phase != GamePhase.BOWLING:
+        state.pending_bowl.pop(bowler_id, None); return
 
-    # ── Spam-free check ──────────────────────────────────────────────────────
-    if chat_id in state.spam_free_chats:
-        bowler = match.players[bowler_id]
+    # Spam-free: same number twice in a row blocked
+    if cid in state.spam_free_chats:
+        bowler = m.players[bowler_id]
         if bowler.last_bowl_number == number:
-            await client.send_message(
-                bowler_id,
-                f"⛔ **Spam-Free ON!** You already bowled {number} last time.\n"
-                f"Send a different number (1–6)!"
-            )
-            return  # keep pending, bowler must try again
+            await client.send_message(bowler_id,
+                f"⛔ **Spam-Free ON!** You bowled {number} last time — send a different number!")
+            return
 
-    match.turn_id += 1
+    m.turn_id += 1
     state.pending_bowl.pop(bowler_id, None)
-    match.bowler_number = number
-    match.players[bowler_id].last_bowl_number = number
-    await client.send_message(bowler_id, "✅ Got it! Ball is bowled... 🎯")
-    await _prompt_batter(client, chat_id, match.current_batter_id, bowler_id)
+    m.bowler_number = number
+    m.players[bowler_id].last_bowl_number = number
+    await client.send_message(bowler_id, "✅ Ball bowled! 🎯")
+    await _prompt_batter(client, cid, m.current_batter_id, bowler_id)
 
-async def _prompt_batter(client, chat_id, batter_id, bowler_id):
-    match = solo_matches.get(chat_id)
-    if not match:
-        return
-    batter = match.players[batter_id]
-    match.phase             = GamePhase.BATTING
-    match.current_batter_id = batter_id
-    match.turn_id           += 1
-    turn = match.turn_id
-    await client.send_message(chat_id, bat_prompt(batter.full_name, match.bowl_number))
-    asyncio.create_task(_bat_timeout(client, chat_id, batter_id, bowler_id, turn))
+async def _prompt_batter(client, cid, batter_id, bowler_id):
+    m = solo_matches.get(cid)
+    if not m: return
+    batter         = m.players[batter_id]
+    m.phase        = GamePhase.BATTING
+    m.turn_id     += 1; turn = m.turn_id
+    await client.send_message(cid, bat_prompt(batter_id, batter.full_name, m.bowl_number, m.overs))
+    asyncio.create_task(_bat_timeout(client, cid, batter_id, bowler_id, turn))
 
-async def _bat_timeout(client, chat_id, batter_id, bowler_id, turn):
+async def _bat_timeout(client, cid, batter_id, bowler_id, turn):
     await asyncio.sleep(Config.BAT_TIMEOUT)
-    match = solo_matches.get(chat_id)
-    if not match or match.turn_id != turn or match.phase != GamePhase.BATTING:
-        return
-    match.turn_id += 1
-    await _resolve_ball(client, chat_id, batter_id, bowler_id, None, timed_out=True)
+    m = solo_matches.get(cid)
+    if not m or m.turn_id != turn or m.phase != GamePhase.BATTING: return
+    m.turn_id += 1
+    await _resolve(client, cid, batter_id, bowler_id, None, timed_out=True)
 
-async def resolve_solo_bat(client, chat_id, batter_id, number):
-    match = solo_matches.get(chat_id)
-    if not match or match.phase != GamePhase.BATTING or match.current_batter_id != batter_id:
-        return
-    match.turn_id += 1
-    await _resolve_ball(client, chat_id, batter_id, match.current_bowler_id, number, timed_out=False)
+async def resolve_solo_bat(client, cid, batter_id, number):
+    m = solo_matches.get(cid)
+    if not m or m.phase != GamePhase.BATTING or m.current_batter_id != batter_id: return
+    m.turn_id += 1
+    await _resolve(client, cid, batter_id, m.current_bowler_id, number, timed_out=False)
 
-async def _resolve_ball(client, chat_id, batter_id, bowler_id, bat_number, timed_out):
-    match = solo_matches.get(chat_id)
-    if not match:
-        return
-
-    batter = match.players[batter_id]
-    bowler = match.players[bowler_id]
-    bowl_n = match.bowler_number
-
+async def _resolve(client, cid, batter_id, bowler_id, bat_num, timed_out):
+    m = solo_matches.get(cid)
+    if not m: return
+    batter  = m.players[batter_id]
+    bowler  = m.players[bowler_id]
+    bowl_n  = m.bowler_number
     bowler.balls_bowled += 1
 
     if timed_out:
-        batter.is_out = True
-        batter.ball_log.append("W")
-        bowler.wickets += 1
-        await client.send_message(chat_id, "⏱️ **Time's up!** Auto OUT!")
-        await send_wicket_gif(client, chat_id, batter.full_name)
-    elif bowl_n is not None and bat_number == bowl_n:
-        batter.is_out = True
-        batter.ball_log.append("W")
-        bowler.wickets += 1
-        await send_wicket_gif(client, chat_id, batter.full_name)
+        batter.is_out = True; batter.ball_log.append("W"); bowler.wickets += 1
+        await client.send_message(cid, f"⏱️ {mention(batter_id, batter.full_name)} timed out — **OUT!**")
+        await send_wicket_gif(client, cid, batter_id, batter.full_name)
+    elif bowl_n is not None and bat_num == bowl_n:
+        batter.is_out = True; batter.ball_log.append("W"); bowler.wickets += 1
+        await send_wicket_gif(client, cid, batter_id, batter.full_name)
     else:
-        runs = bat_number
-        batter.runs  += runs
-        batter.balls += 1
-        batter.ball_log.append(runs)
+        runs = bat_num if bat_num is not None else 0
+        batter.runs += runs; batter.balls += 1; batter.ball_log.append(runs)
         bowler.runs_given += runs
-        if runs == 4:
-            batter.fours += 1
-        elif runs == 6:
-            batter.sixes += 1
-        if runs == 0:
-            batter.zeros_this_over += 1
-            await client.send_message(chat_id, dot_ball_msg(batter.full_name))
-        else:
-            await send_run_gif(client, chat_id, runs, batter.full_name)
+        if runs == 4: batter.fours += 1
+        elif runs == 6: batter.sixes += 1
+        if runs == 0: batter.zeros_this_over += 1
+        await send_run_gif(client, cid, runs, batter_id, batter.full_name)
         if batter.runs in (50, 100):
-            await client.send_message(chat_id, century_msg(batter.full_name, batter.runs))
+            await client.send_message(cid, century_msg(batter_id, batter.full_name, batter.runs))
 
-    match.bowler_number = None
+    m.bowler_number = None
 
-    if not batter.is_out and batter.balls >= match.overs:
-        batter.is_out = True
-    match.current_bowler_idx += 1
+    # Batter done when all balls faced OR out
+    batter_done = batter.is_out or batter.balls >= m.overs
+    if not batter.is_out and batter.balls >= m.overs:
+        batter.is_out = True  # used innings, mark done
 
-    # Reset per-over zero counter every `overs` balls
-    if batter.balls > 0 and batter.balls % match.overs == 0:
-        batter.zeros_this_over = 0
+    if batter_done:
+        # Switch bowler only when batter is done (full over completed)
+        m.current_bowler_idx += 1
+        m.bowl_number = 0          # reset ball counter for next batter's over
+        batter.zeros_this_over = 0 # reset dot-ball counter
 
-    remaining = [uid for uid in match.order if not match.players[uid].is_out]
-    if not remaining:
-        await finish_solo_match(client, chat_id)
-    else:
-        await next_ball(client, chat_id)
+    remaining = [uid for uid in m.order if not m.players[uid].is_out]
+    if not remaining: await _finish(client, cid)
+    else: await _next_ball(client, cid)
 
-async def finish_solo_match(client: Client, chat_id: int):
-    match = solo_matches.get(chat_id)
-    if not match:
-        return
-    match.phase = GamePhase.FINISHED
-    state.pending_bowl.pop(match.current_bowler_id, None)
+async def _finish(client, cid):
+    m = solo_matches.get(cid)
+    if not m: return
+    m.phase = GamePhase.FINISHED
+    state.pending_bowl.pop(m.current_bowler_id, None)
+    if not m.players: solo_matches.pop(cid, None); return
 
-    if not match.players:
-        solo_matches.pop(chat_id, None)
-        return
+    best_bat = max(m.players.values(), key=lambda p: p.runs)
+    best_bwl = max(m.players.values(), key=lambda p: p.wickets)
+    motm     = max(m.players.values(), key=lambda p: p.runs + p.wickets * 15)
 
-    best_batter = max(match.players.values(), key=lambda p: p.runs)
-    best_bowler = max(match.players.values(), key=lambda p: p.wickets)
-    motm        = max(match.players.values(), key=lambda p: p.runs + p.wickets * 15)
+    await client.send_message(cid, solo_result_card(
+        [vars(p) for p in m.players.values()], m.overs,
+        best_bat.full_name, best_bwl.full_name, motm.full_name))
+    await send_trophy_gif(client, cid, f"⭐ **Player of the Match:** {mention(motm.user_id, motm.full_name)}")
 
-    await client.send_message(
-        chat_id,
-        solo_result_card(
-            [vars(p) for p in match.players.values()], match.overs,
-            best_batter.full_name, best_bowler.full_name, motm.full_name
-        )
-    )
-    await send_trophy_gif(client, chat_id, f"⭐ **Player of the Match:** {motm.full_name}")
-
-    for p in match.players.values():
-        await update_batting_stats(
-            p.user_id, p.full_name, p.runs, p.balls, p.fours, p.sixes,
-            p.is_out, won=(p.user_id == best_batter.user_id)
-        )
+    for p in m.players.values():
+        await update_batting_stats(p.user_id, p.full_name, p.runs, p.balls, p.fours, p.sixes, p.is_out, won=(p.user_id==best_bat.user_id))
         if p.balls_bowled > 0:
-            await update_bowling_stats(
-                p.user_id, p.full_name, p.wickets, p.runs_given, p.balls_bowled, p.wickets >= 3
-            )
+            await update_bowling_stats(p.user_id, p.full_name, p.wickets, p.runs_given, p.balls_bowled, p.wickets >= 3)
     await update_motm(motm.user_id, motm.full_name)
-    solo_matches.pop(chat_id, None)
+    solo_matches.pop(cid, None)
 
-# ── Input Filters & Handlers (no pyromod) ────────────────────────────────────
+# ── Input handlers ────────────────────────────────────────────────────────────
 
-def _solo_bowl_pending(_, __, m: Message) -> bool:
-    return bool(m.from_user) and state.pending_bowl.get(m.from_user.id, {}).get("kind") == "solo"
-
-def _solo_bat_turn(_, __, m: Message) -> bool:
+def _bowl_pend(_, __, m): return bool(m.from_user) and state.pending_bowl.get(m.from_user.id, {}).get("kind") == "solo"
+def _bat_turn(_, __, m):
     match = solo_matches.get(getattr(m.chat, "id", None))
-    return bool(
-        match and match.phase == GamePhase.BATTING
-        and m.from_user and m.from_user.id == match.current_batter_id
-    )
+    return bool(match and match.phase == GamePhase.BATTING and m.from_user and m.from_user.id == match.current_batter_id)
 
-solo_bowl_filter = filters.create(_solo_bowl_pending)
-solo_bat_filter  = filters.create(_solo_bat_turn)
+solo_bowl_f = filters.create(_bowl_pend)
+solo_bat_f  = filters.create(_bat_turn)
 
-@Client.on_message(filters.private & filters.regex(r"^\s*\d{1,3}\s*$") & solo_bowl_filter)
-async def solo_bowl_dm_input(client: Client, message: Message):
-    number = int(message.text.strip())
-    if not (1 <= number <= 6):
-        return await message.reply("⚠️ Send a number between 1–6!")
-    await resolve_solo_bowl(client, message.from_user.id, number)
+@Client.on_message(filters.private & filters.regex(r"^\s*\d{1,2}\s*$") & solo_bowl_f)
+async def on_bowl_dm(client, msg: Message):
+    n = int(msg.text.strip())
+    if not 1 <= n <= 6: return await msg.reply("⚠️ 1 se 6 ke beech number bhejo!")
+    await resolve_solo_bowl(client, msg.from_user.id, n)
 
-@Client.on_message(filters.group & filters.regex(r"^\s*\d{1,3}\s*$") & solo_bat_filter)
-async def solo_bat_group_input(client: Client, message: Message):
-    number = int(message.text.strip())
-    if not (1 <= number <= 6):
-        return
+@Client.on_message(filters.group & filters.regex(r"^\s*\d{1,2}\s*$") & solo_bat_f)
+async def on_bat_gc(client, msg: Message):
+    n = int(msg.text.strip())
+    m = solo_matches.get(msg.chat.id)
+    if not m: return
 
-    match = solo_matches.get(message.chat.id)
-    if not match:
-        return
-
-    # ── Dot-ball spam limit: max 2 zeros per over ────────────────────────────
-    if number == 0:
-        batter = match.players.get(message.from_user.id)
+    # 0 is a valid dot-ball choice — limit to MAX_ZEROS_PER_OVER per over
+    if n == 0:
+        batter = m.players.get(msg.from_user.id)
         if batter and batter.zeros_this_over >= Config.MAX_ZEROS_PER_OVER:
-            return await message.reply(
-                f"⛔ Max {Config.MAX_ZEROS_PER_OVER} dot balls per over!\n"
-                f"Send a number between **1–6**."
-            )
-
-    await resolve_solo_bat(client, message.chat.id, message.from_user.id, number)
+            return await msg.reply(f"⛔ Max {Config.MAX_ZEROS_PER_OVER} dot balls per over! Send 1–6.")
+    elif not 1 <= n <= 6:
+        return
+    await resolve_solo_bat(client, msg.chat.id, msg.from_user.id, n)
