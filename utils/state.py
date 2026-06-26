@@ -11,46 +11,38 @@ class GamePhase(Enum):
     INNINGS_BREAK = "innings_break"
     FINISHED      = "finished"
 
-class MatchType(Enum):
-    SOLO       = "solo"
-    TEAM       = "team"
-    TOURNAMENT = "tournament"
-
 @dataclass
 class PlayerScore:
     user_id:    int
     full_name:  str
-    runs:       int   = 0
-    balls:      int   = 0
-    fours:      int   = 0
-    sixes:      int   = 0
-    is_out:     bool  = False
-    wickets:    int   = 0
-    runs_given: int   = 0
+    runs:       int  = 0
+    balls:      int  = 0
+    fours:      int  = 0
+    sixes:      int  = 0
+    is_out:     bool = False
+    wickets:    int  = 0
+    runs_given: int  = 0
     balls_bowled: int = 0
-    ball_log:   List  = field(default_factory=list)
+    ball_log:   List = field(default_factory=list)
     consecutive_penalties: int = 0
-    last_bowl_number: Optional[int] = None   # spam-free: last number bowled
-    zeros_this_over:  int = 0               # dot-ball limit: 0s sent this over
+    last_bowl_number: Optional[int] = None
+    zeros_this_over:  int = 0
 
 @dataclass
 class SoloMatch:
-    chat_id:        int
-    host_id:        int
-    overs:          int
-    phase:          GamePhase            = GamePhase.JOINING
-    players:        Dict[int, PlayerScore] = field(default_factory=dict)
-    order:          List[int]            = field(default_factory=list)
-    current_batter_idx:  int             = 0
-    current_bowler_idx:  int             = 0
-    bowl_number:    int                  = 0
-    bowler_number:  Optional[int]        = None
-    join_msg_id:    Optional[int]        = None
-    score_msg_id:   Optional[int]        = None
-    timer_task:     Optional[asyncio.Task] = None
-    current_batter_id: Optional[int]     = None
-    current_bowler_id: Optional[int]     = None
-    turn_id:        int                  = 0
+    chat_id:           int
+    host_id:           int
+    overs:             int                   # balls per batter (3 or 6)
+    phase:             GamePhase             = GamePhase.JOINING
+    players:           Dict[int, PlayerScore]= field(default_factory=dict)
+    order:             List[int]             = field(default_factory=list)
+    current_bowler_idx: int                  = 0
+    bowl_number:       int                   = 0   # ball# in current batter's over
+    bowler_number:     Optional[int]         = None
+    join_msg_id:       Optional[int]         = None
+    current_batter_id: Optional[int]         = None
+    current_bowler_id: Optional[int]         = None
+    turn_id:           int                   = 0
 
 @dataclass
 class TeamPlayer:
@@ -72,33 +64,30 @@ class TeamPlayer:
 class TeamMatch:
     chat_id:         int
     host_id:         int
-    phase:           GamePhase             = GamePhase.JOINING
-    team_a:          Dict[int, TeamPlayer] = field(default_factory=dict)
-    team_b:          Dict[int, TeamPlayer] = field(default_factory=dict)
-    cap_a:           Optional[int]         = None
-    cap_b:           Optional[int]         = None
-    overs:           int                   = 0
-    toss_winner:     Optional[str]         = None
-    batting_team:    Optional[str]         = None
-    bowling_team:    Optional[str]         = None
-    innings:         int                   = 1
-    team_a_score:    int                   = 0
-    team_b_score:    int                   = 0
-    team_a_wickets:  int                   = 0
-    team_b_wickets:  int                   = 0
-    current_batter:  Optional[int]         = None
-    current_bowler:  Optional[int]         = None
-    striker:         Optional[int]         = None
-    non_striker:     Optional[int]         = None
-    ball_count:      int                   = 0
-    over_count:      int                   = 0
-    bowler_number:   Optional[int]         = None
-    target:          Optional[int]         = None
-    last_3_wickets:  List[int]             = field(default_factory=list)
-    timer_task:      Optional[asyncio.Task] = None
-    join_a_msg_id:   Optional[int]         = None
-    join_b_msg_id:   Optional[int]         = None
-    turn_id:         int                   = 0
+    phase:           GamePhase              = GamePhase.JOINING
+    team_a:          Dict[int, TeamPlayer]  = field(default_factory=dict)
+    team_b:          Dict[int, TeamPlayer]  = field(default_factory=dict)
+    cap_a:           Optional[int]          = None
+    cap_b:           Optional[int]          = None
+    overs:           int                    = 0   # total overs per innings
+    toss_winner:     Optional[str]          = None
+    batting_team:    Optional[str]          = None
+    bowling_team:    Optional[str]          = None
+    innings:         int                    = 1
+    team_a_score:    int                    = 0
+    team_b_score:    int                    = 0
+    team_a_wickets:  int                    = 0
+    team_b_wickets:  int                    = 0
+    striker:         Optional[int]          = None
+    non_striker:     Optional[int]          = None
+    current_bowler:  Optional[int]          = None
+    ball_count:      int                    = 0   # balls in current over (0-5)
+    over_count:      int                    = 0   # completed overs this innings
+    bowler_number:   Optional[int]          = None
+    target:          Optional[int]          = None
+    last_3_wickets:  List[int]              = field(default_factory=list)
+    join_a_msg_id:   Optional[int]          = None
+    turn_id:         int                    = 0
 
 @dataclass
 class TournamentTeam:
@@ -118,19 +107,12 @@ class Tournament:
     current_match: Optional[dict] = None
     results:       List       = field(default_factory=list)
 
-# ── Global State ─────────────────────────────────────────────────────────────
-
+# ── Global State ──────────────────────────────────────────────────────────────
 solo_matches:     Dict[int, SoloMatch]  = {}
 team_matches:     Dict[int, TeamMatch]  = {}
 tournaments:      Dict[int, Tournament] = {}
 maintenance_mode: bool = False
-
-# Bot identity — populated once at startup from get_me()
 bot_name:     str = "Cric Craze"
 bot_username: str = ""
-
-# Bowler DM input registry (replaces pyromod listen)
 pending_bowl: Dict[int, dict] = {}
-
-# Spam-free: set of chat_ids where bowlers cannot bowl the same number twice in a row
 spam_free_chats: Set[int] = set()
